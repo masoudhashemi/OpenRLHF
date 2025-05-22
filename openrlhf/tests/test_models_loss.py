@@ -442,3 +442,158 @@ def test_disco_basic_loss_with_positive_kl_penalty():
     assert_close(actual_penalty, _t(0.005))
     assert_close(actual_j1, _t(0.0))
     assert_close(actual_loss, _t(0.005))
+
+
+# Tests for PolicyLoss
+from openrlhf.models.loss import PolicyLoss
+
+def test_policy_loss_dapo_clipping():
+    # Instantiate PolicyLoss with specific dapo clip_eps_low and clip_eps_high
+    # Using clip_eps_low=0.1, clip_eps_high=0.3 for distinct clipping
+    policy_loss_fn = PolicyLoss(clip_eps_low=0.1, clip_eps_high=0.3, token_level_loss=True)
+
+    # Dummy data
+    # Batch size = 2, Sequence length (action part) = 3
+    log_probs = _t([
+        [0.5, 0.6, 0.7], 
+        [0.4, 0.3, 0.2]
+    ]) 
+    old_log_probs = _t([
+        [0.4, 0.5, 0.6], # ratio for sample 0: exp(0.1) approx 1.105 for all tokens
+        [0.5, 0.4, 0.3]  # ratio for sample 1: exp(-0.1) approx 0.904 for all tokens
+    ])
+    advantages = _t([
+        [1.0, 2.0, -1.0], # Positive and negative advantages
+        [1.5, -1.5, 0.5]
+    ])
+    action_mask = _t([
+        [True, True, True], 
+        [True, True, False] # Last action of sample 1 is masked
+    ], dtype=torch.bool)
+
+    # Expected calculations
+    # Ratio = exp(log_probs - old_log_probs)
+    # Sample 0 ratios: [exp(0.1), exp(0.1), exp(0.1)] approx [1.10517, 1.10517, 1.10517]
+    # Sample 1 ratios: [exp(-0.1), exp(-0.1), exp(-0.1)] approx [0.90483, 0.90483, 0.90483]
+
+    # surr1 = ratio * advantages
+    # s0_surr1 = [1.10517 * 1.0, 1.10517 * 2.0, 1.10517 * -1.0] = [1.10517, 2.21034, -1.10517]
+    # s1_surr1 = [0.90483 * 1.5, 0.90483 * -1.5, 0.90483 * 0.5] = [1.35725, -1.35725, 0.45242]
+
+    # surr2 = clamp(ratio, 1 - clip_eps_low, 1 + clip_eps_high) * advantages
+    # clamp_low = 1 - 0.1 = 0.9
+    # clamp_high = 1 + 0.3 = 1.3
+    
+    # Sample 0 ratios clamped:
+    # ratio00 = 1.10517 -> clamped_ratio00 = 1.10517 (within 0.9, 1.3)
+    # ratio01 = 1.10517 -> clamped_ratio01 = 1.10517
+    # ratio02 = 1.10517 -> clamped_ratio02 = 1.10517
+    # s0_surr2 = [1.10517 * 1.0, 1.10517 * 2.0, 1.10517 * -1.0] = [1.10517, 2.21034, -1.10517]
+    # (In this case, ratio for sample 0 is not clipped by 0.9 or 1.3)
+
+    # Sample 1 ratios clamped:
+    # ratio10 = 0.90483 -> clamped_ratio10 = 0.90483 (within 0.9, 1.3, but close to lower bound)
+    # ratio11 = 0.90483 -> clamped_ratio11 = 0.90483
+    # ratio12 = 0.90483 -> clamped_ratio12 = 0.90483
+    # s1_surr2 = [0.90483 * 1.5, 0.90483 * -1.5, 0.90483 * 0.5] = [1.35725, -1.35725, 0.45242]
+    # (In this case, ratio for sample 1 is also not clipped by 0.9 or 1.3)
+
+    # Let's adjust old_log_probs to force clipping
+    old_log_probs_for_clipping = _t([
+        [0.4, 0.5, 0.0], # ratio02: exp(0.7) approx 2.013 -> clipped to 1.3
+        [0.8, 0.7, 0.3]  # ratio10: exp(-0.4) approx 0.670 -> clipped to 0.9
+    ])
+    # Sample 0: log_probs = [0.5, 0.6, 0.7], old_log_probs = [0.4, 0.5, 0.0]
+    # Ratios s0: [exp(0.1), exp(0.1), exp(0.7)] approx [1.105, 1.105, 2.014]
+    # Advantages s0: [1.0, 2.0, -1.0]
+    # s0_surr1 = [1.105*1, 1.105*2, 2.014*-1] = [1.105, 2.210, -2.014]
+    
+    # Clamped ratios s0: [1.105 (no clip), 1.105 (no clip), 1.3 (clipped from 2.014)]
+    # s0_surr2 = [1.105*1, 1.105*2, 1.3*-1] = [1.105, 2.210, -1.3]
+    
+    # Min for s0 (surr1 vs surr2), then negated for loss
+    # loss00 = -min(1.105, 1.105) = -1.105
+    # loss01 = -min(2.210, 2.210) = -2.210
+    # loss02 = -min(-2.014, -1.3) = -(-2.014) = 2.014 (if adv is negative, min picks more negative, -loss makes it positive)
+    # So, for negative advantages, we want min(ratio * adv, clamped_ratio * adv).
+    # If adv < 0: ratio*adv vs clamped_ratio*adv. If ratio > clamped_ratio (e.g. ratio=2.014, clamped=1.3),
+    # then ratio*adv is more negative (-2.014) than clamped_ratio*adv (-1.3). So min picks ratio*adv.
+    # Loss = - (ratio*adv) = 2.014. This is correct.
+    
+    # Sample 1: log_probs = [0.4, 0.3, 0.2], old_log_probs = [0.8, 0.7, 0.3]
+    # Ratios s1: [exp(-0.4), exp(-0.4), exp(-0.1)] approx [0.670, 0.670, 0.905]
+    # Advantages s1: [1.5, -1.5, 0.5]
+    # s1_surr1 = [0.670*1.5, 0.670*-1.5, 0.905*0.5] = [1.005, -1.005, 0.4525]
+
+    # Clamped ratios s1: [0.9 (clipped from 0.670), 0.9 (clipped from 0.670), 0.905 (no clip)]
+    # s1_surr2 = [0.9*1.5, 0.9*-1.5, 0.905*0.5] = [1.35, -1.35, 0.4525]
+
+    # Min for s1 (surr1 vs surr2), then negated for loss
+    # loss10 = -min(1.005, 1.35) = -1.005
+    # loss11 = -min(-1.005, -1.35). If adv < 0, and ratio < clamped_ratio (e.g. ratio=0.670, clamped=0.9)
+    # then ratio*adv (-1.005) is LESS negative than clamped_ratio*adv (-1.35). So min picks clamped_ratio*adv.
+    # Loss = - (clamped_ratio*adv) = 1.35. This is correct.
+    # loss12 = -min(0.4525, 0.4525) = -0.4525
+    
+    # Per-token losses before masking and mean:
+    # losses_s0 = [-1.10517, -2.21034, 2.01375] (using more precision for exp(0.1)=1.10517, exp(0.7)=2.01375)
+    # losses_s1 = [-1.00505, 1.35000, -0.45242] (using exp(-0.4)=0.67032, exp(-0.1)=0.90484)
+
+    # Apply action_mask:
+    # losses_s0 remains [-1.10517, -2.21034, 2.01375] (all True)
+    # losses_s1 becomes [-1.00505, 1.35000, 0.0 (masked)] (last one False)
+    
+    # Sum of losses where mask is true:
+    # -1.10517 - 2.21034 + 2.01375 - 1.00505 + 1.35000 = -0.95681
+    # Number of true elements in mask: 3 (s0) + 2 (s1) = 5
+    # Expected final loss = -0.95681 / 5 = -0.191362
+
+    calculated_loss = policy_loss_fn(log_probs, old_log_probs_for_clipping, advantages, action_mask)
+    assert_close(calculated_loss, _t(-0.191362), rtol=1e-4, atol=1e-4)
+
+def test_policy_loss_token_level_verification():
+    # Test token_level_loss = True (DAPO case)
+    policy_loss_fn_token_true = PolicyLoss(clip_eps_low=0.2, clip_eps_high=0.2, token_level_loss=True)
+    log_probs = _t([[0.5, 0.6], [0.4, 0.3]])
+    old_log_probs = _t([[0.4, 0.5], [0.5, 0.4]])
+    advantages = _t([[1.0, 2.0], [1.5, -1.5]])
+    action_mask = _t([[True, True], [True, False]], dtype=torch.bool)
+
+    # ratio = exp(0.1) approx 1.10517
+    # For token_level_loss=True:
+    # s0_ratios = [1.10517, 1.10517]
+    # s1_ratios = [exp(-0.1), exp(-0.1)] approx [0.90484, 0.90484]
+    # clip_eps = 0.2, so clamp range is [0.8, 1.2]
+    
+    # s0_adv = [1.0, 2.0]
+    # s0_surr1 = [1.10517, 2.21034]
+    # s0_clamped_ratios = [1.10517, 1.10517] (no clip)
+    # s0_surr2 = [1.10517, 2.21034]
+    # s0_losses = [-min(s0_s1, s0_s2)] = [-1.10517, -2.21034]
+    
+    # s1_adv = [1.5, -1.5]
+    # s1_surr1 = [0.90484 * 1.5, 0.90484 * -1.5] = [1.35726, -1.35726]
+    # s1_clamped_ratios = [0.90484, 0.90484] (no clip)
+    # s1_surr2 = [1.35726, -1.35726]
+    # s1_losses = [-min(s1_s1, s1_s2)] = [-1.35726, 1.35726]
+    
+    # All per-token losses: [-1.10517, -2.21034, -1.35726, 1.35726]
+    # Apply action_mask:
+    # Masked losses: [-1.10517, -2.21034, -1.35726, 0.0 (masked)]
+    # Sum of masked losses = -1.10517 - 2.21034 - 1.35726 = -4.67277
+    # Sum of mask = 3
+    # Expected loss (token_level_loss=True) = -4.67277 / 3 = -1.55759
+    
+    loss_true = policy_loss_fn_token_true(log_probs, old_log_probs, advantages, action_mask)
+    assert_close(loss_true, _t(-1.55759), rtol=1e-4, atol=1e-4)
+
+    # Test token_level_loss = False (GRPO case / mean of per-sequence means)
+    policy_loss_fn_token_false = PolicyLoss(clip_eps_low=0.2, clip_eps_high=0.2, token_level_loss=False)
+    # Per-sequence losses (mean of per-token losses for that sequence):
+    # Seq 0 losses: [-1.10517, -2.21034]. Mask: [T, T]. Mean = (-1.10517 - 2.21034) / 2 = -1.657755
+    # Seq 1 losses: [-1.35726, 1.35726]. Mask: [T, F]. Mean = (-1.35726 * 1 + 1.35726 * 0) / 1 = -1.35726
+    # Expected loss (token_level_loss=False) = mean([-1.657755, -1.35726]) = (-1.657755 - 1.35726) / 2 = -1.5075075
+    
+    loss_false = policy_loss_fn_token_false(log_probs, old_log_probs, advantages, action_mask)
+    assert_close(loss_false, _t(-1.5075075), rtol=1e-4, atol=1e-4)
+

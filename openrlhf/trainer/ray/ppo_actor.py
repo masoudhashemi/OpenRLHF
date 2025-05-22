@@ -42,7 +42,9 @@ class ActorPPOTrainer(ABC):
         micro_train_batch_size: int = 8,
         buffer_limit: int = 0,
         buffer_cpu_offload: bool = True,
-        eps_clip: float = 0.2,
+        eps_clip: float = 0.2, # Keep for compatibility if ValueLoss uses it, or for other PPO variants
+        dapo_clip_eps_low: float = 0.2,
+        dapo_clip_eps_high: float = 0.28,
         tokenizer=None,
         dataloader_pin_memory: bool = True,
         vllm_engines: List = None,
@@ -68,7 +70,7 @@ class ActorPPOTrainer(ABC):
         self.vllm_engines = vllm_engines
         self.max_epochs = self.args.max_epochs
 
-        self.actor_loss_fn = PolicyLoss(eps_clip)
+        self.actor_loss_fn = PolicyLoss(clip_eps_low=dapo_clip_eps_low, clip_eps_high=dapo_clip_eps_high)
         # DisCO Loss (initialized if needed in training_step)
         self.disco_loss_fn = None
 
@@ -541,7 +543,9 @@ class ActorModelRayActor(BasePPORole):
             actor_scheduler=self.actor_scheduler,
             micro_train_batch_size=args.micro_train_batch_size,
             tokenizer=self.tokenizer,
-            eps_clip=args.eps_clip,
+            eps_clip=args.eps_clip, # Keep for other potential uses or if ValueLoss needs it
+            dapo_clip_eps_low=args.dapo_clip_eps_low,
+            dapo_clip_eps_high=args.dapo_clip_eps_high,
             ema_beta=args.ema_beta,
             vllm_engines=self.vllm_engines,
         )

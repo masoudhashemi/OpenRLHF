@@ -488,12 +488,13 @@ class PPOTrainer(BasePPOTrainer):
                             continue
 
                         # Calculate average reward for this batch of samples
-                        avg_reward = sum(sample.rewards[0] for sample in batch_samples) / len(batch_samples)
-
+                        avg_reward = sum(s.rewards[0] for s in batch_samples) / len(batch_samples)
+                        
                         # Check if average reward is within the specified range
-                        min_reward, max_reward = self.args.dynamic_filtering_reward_range
-                        if min_reward + 1e-6 < avg_reward < max_reward - 1e-6:
+                        min_r, max_r = self.args.dynamic_filtering_reward_range
+                        if min_r + 1e-6 < avg_reward < max_r - 1e-6: # Ensure strict inequality
                             filtered_samples.extend(batch_samples)
+                        # Else, the prompt and its samples are discarded
 
                     # Continue sampling if filtered samples are insufficient
                     if len(filtered_samples) / self.args.n_samples_per_prompt < self.args.rollout_batch_size:

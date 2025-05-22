@@ -348,8 +348,8 @@ class RemoteExperienceMaker(ABC):
         self.initial_model_group = initial_model_group
         self.kl_ctl = kl_controller
         self.strategy = strategy
-        self.advantage_estimator = strategy.args.advantage_estimator
-        self.args = strategy.args
+        self.advantage_estimator = strategy.args.advantage_estimator # strategy is already stored
+        self.args = strategy.args # args is already stored
 
         # remote_rm_url indicates that the remote reward model is agent enviroment, remote http server or custom reward func
         self.remote_rm_url = self.args.remote_rm_url
@@ -392,6 +392,28 @@ class RemoteExperienceMaker(ABC):
         args = self.strategy.args
         device = "cpu"
         experiences = []
+
+        # Overlong filtering (DAPO Part 1)
+        if self.args.dapo_enable_overlong_filtering:
+            for samples_obj in samples_list: # samples_obj is an instance of Samples class
+                sequences_in_obj = samples_obj.sequences # (batch_size, seq_len)
+                attention_mask_in_obj = samples_obj.attention_mask # (batch_size, seq_len)
+                action_mask_in_obj = samples_obj.action_mask # (batch_size, action_len)
+
+                for i in range(sequences_in_obj.size(0)):
+                    current_seq_len = attention_mask_in_obj[i].sum().item()
+                    # self.args.max_len is the total length (prompt + response)
+                    # sequences are right-padded, so actual length is sum of attention_mask
+                    is_truncated = (current_seq_len == self.args.max_len) and \
+                                   (sequences_in_obj[i, current_seq_len - 1].item() != self.tokenizer.eos_token_id)
+                    
+                    if is_truncated:
+                        if action_mask_in_obj is not None: # action_mask might be None for packed samples
+                            action_mask_in_obj[i, :] = False
+                        # Also, if rewards are per-token, they should be zeroed out.
+                        # For now, DAPO applies R_length, and this filtering zeros out the PPO objective.
+                        # If rewards are per-sequence (which they are from reward model), this filtering will make
+                        # the advantage/return for this sequence zero when combined with an all-false action_mask.
 
         # Extract all information from samples in one pass
         # Convert samples into lists of tensors and metadata for batch processing
@@ -604,12 +626,23 @@ class RemoteExperienceMaker(ABC):
 
         # calculate return and advantages
         for experience, reward in zip(experiences, rewards):
+            # Prepare dapo_args for compute_reward
+            dapo_args_dict = None
+            if hasattr(args, "enable_dapo_overlong_reward_shaping"): # Check if DAPO args exist
+                dapo_args_dict = {
+                    "enable_dapo_overlong_reward_shaping": args.enable_dapo_overlong_reward_shaping,
+                    "dapo_l_max": args.dapo_l_max,
+                    "dapo_l_cache": args.dapo_l_cache,
+                }
+
             reward = compute_reward(
                 reward,
                 self.kl_ctl.value,
-                experience.kl,
+                experience.kl, # This is per-token KL
                 action_mask=experience.action_mask,
                 reward_clip_range=args.reward_clip_range,
+                response_lengths=experience.info["response_length"], # Pass response_lengths
+                dapo_args=dapo_args_dict, # Pass dapo_args
             )
 
             if self.advantage_estimator == "gae":
