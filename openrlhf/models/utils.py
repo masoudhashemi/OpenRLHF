@@ -41,19 +41,62 @@ def compute_approx_kl(
 
 
 def compute_reward(
-    r: Union[torch.Tensor, float],
+    r: Union[torch.Tensor, float], # Per-sequence correctness reward
     kl_coef: float,
-    kl: Union[torch.Tensor, list[torch.Tensor]],
+    kl: Union[torch.Tensor, list[torch.Tensor]], # Per-token KL divergence
     action_mask: Optional[torch.Tensor] = None,
     reward_clip_range: Tuple[float, float] = None,
-) -> Union[torch.Tensor, list[torch.Tensor]]:
+    response_lengths: Optional[torch.Tensor] = None, # Per-sequence response lengths
+    dapo_args: Optional[dict] = None,
+) -> Union[torch.Tensor, list[torch.Tensor]]: # Output is per-token reward
     if kl_coef <= 0.0:
         kl_coef = 0.0
 
+    # Apply R_length if enabled (DAPO Part 2)
+    if dapo_args and dapo_args.get("enable_dapo_overlong_reward_shaping") and response_lengths is not None:
+        # Ensure r is a tensor for manipulation, even if a single float was passed for a single sample
+        if not isinstance(r, torch.Tensor):
+            r = torch.tensor([r], device=response_lengths.device, dtype=torch.float32)
+        elif r.dim() == 0: # if r is a 0-dim tensor (scalar)
+             r = r.unsqueeze(0)
+
+
+        l_max = dapo_args.get("dapo_l_max", 20480) 
+        l_cache = dapo_args.get("dapo_l_cache", 4096)
+        
+        r_length_values = torch.zeros_like(response_lengths, dtype=torch.float32, device=r.device)
+        for i in range(response_lengths.size(0)):
+            seq_len = response_lengths[i].item()
+            if seq_len > l_max - l_cache:
+                if seq_len <= l_max:
+                    # Ensure l_cache is not zero to avoid division by zero if it can be configured.
+                    # Default is 4096, so safe.
+                    r_length_values[i] = ( (l_max - l_cache) - seq_len ) / float(max(l_cache, 1))
+                else: # seq_len > l_max
+                    r_length_values[i] = -1.0
+        r = r + r_length_values
+
+    # Clip the combined reward (correctness + R_length) or original r
     if reward_clip_range:
         r = r.clamp(min=reward_clip_range[0], max=reward_clip_range[1])
 
-    kl_reward = -kl_coef * kl
+    kl_reward = -kl_coef * kl # kl is per-token (B, A)
+    
+    # Scatter the (potentially modified by R_length and clipped) per-sequence reward 'r' 
+    # to the last token position for each sequence.
+    # last_reward will be of shape (B, A)
+    # Ensure r is on the same device as kl and has the correct shape for scatter_
+    if not isinstance(r, torch.Tensor): # Should be tensor due to above block, but as safeguard
+        r_tensor = torch.tensor(r, device=kl.device, dtype=kl.dtype)
+    else:
+        r_tensor = r.to(device=kl.device, dtype=kl.dtype)
+
+    if r_tensor.dim() == 0: # If r was a single float for a single sample
+        r_tensor = r_tensor.unsqueeze(0)
+    
+    # Ensure r_tensor is [B, 1] for scatter_
+    r_for_scatter = r_tensor.unsqueeze(1) if r_tensor.dim() == 1 else r_tensor
+
     # The following code is equivalent to:
     #
     # last_reward = torch.zeros_like(kl)
